@@ -1,7 +1,6 @@
 """Helper functions to save charts to a file, if plt.show() is called."""
 import ast
 import os
-from datetime import datetime
 from itertools import zip_longest
 from os.path import dirname
 from typing import Union
@@ -14,8 +13,20 @@ def compare_ast(
     node2: Union[ast.expr, list[ast.expr], ast.stmt, ast.AST],
     ignore_args=False,
 ) -> bool:
-    """Compare two AST nodes for equality.
-    Source: https://stackoverflow.com/a/66733795/11080806"""
+    """
+    Compare two AST nodes for equality.
+    Source: https://stackoverflow.com/a/66733795/11080806
+
+    Args:
+        node1 (ast.AST): First AST node to compare.
+        node2 (ast.AST): Second AST node to compare.
+        ignore_args (bool, optional): Whether to ignore the arguments of the nodes.
+            Defaults to False.
+
+    Returns:
+        bool: True if the nodes are equal, False otherwise.
+
+    """
     if type(node1) is not type(node2):
         return False
 
@@ -37,16 +48,22 @@ def compare_ast(
     return node1 == node2
 
 
-def add_save_chart(code: str) -> str:
-    """Add line to code that save charts to a file, if plt.show() is called."""
-    date = datetime.now().strftime("%Y-%m-%d")
-    timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+def add_save_chart(code: str, folder_name: str) -> str:
+    """
+    Add line to code that save charts to a file, if plt.show() is called.
+
+    Args:
+        code (str): Code to add line to.
+        folder_name (str): Name of folder to save charts to.
+
+    Returns:
+        str: Code with line added.
+
+    """
 
     # define chart save directory
     project_root = dirname(dirname(dirname(__file__)))
-    chart_save_dir = os.path.join(project_root, f"exports\\charts\\{date}")
-    if not os.path.exists(chart_save_dir):
-        os.makedirs(chart_save_dir)
+    chart_save_dir = os.path.join(project_root, "exports", "charts", folder_name)
 
     tree = ast.parse(code)
 
@@ -60,18 +77,21 @@ def add_save_chart(code: str) -> str:
     if show_count == 0:
         return code
 
+    if not os.path.exists(chart_save_dir):
+        os.makedirs(chart_save_dir)
+
     # iterate through the AST and add plt.savefig() calls before plt.show() calls
     counter = ord("a")
     new_body = []
     for node in tree.body:
         if compare_ast(node, ast.parse("plt.show()").body[0], ignore_args=True):
-            filename = f"chart_{timestamp}"
+            filename = "chart"
             if show_count > 1:
                 filename += f"_{chr(counter)}"
                 counter += 1
-            new_body.append(
-                ast.parse(f"plt.savefig(r'{chart_save_dir}\\{filename}.png')")
-            )
+
+            chart_save_path = os.path.join(chart_save_dir, f"{filename}.png")
+            new_body.append(ast.parse(f"plt.savefig(r'{chart_save_path}')"))
         new_body.append(node)
 
     new_body.append(ast.parse(f"print(r'Charts saved to: {chart_save_dir}')"))

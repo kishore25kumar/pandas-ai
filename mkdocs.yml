@@ -11,6 +11,7 @@ theme:
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
+  - Cache: cache.md
   - Command Line Tool: pai_cli.md
   - API:
       - API/pandasai.md
@@ -24,7 +25,7 @@ nav:
       - Documents Building: building_docs.md
       - License: license.md
 extra:
-  version: "0.3.0"
+  version: "0.4.1"
 plugins:
   - search
   - mkdocstrings:

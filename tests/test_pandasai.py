@@ -3,6 +3,7 @@
 from datetime import date
 from typing import Optional
 from unittest.mock import Mock, patch
+from uuid import UUID
 
 import pandas as pd
 import pytest
@@ -25,11 +26,11 @@ class TestPandasAI:
 
     @pytest.fixture
     def pandasai(self, llm):
-        return PandasAI(llm)
+        return PandasAI(llm, enable_cache=False)
 
     def test_init(self, pandasai):
         assert pandasai._llm is not None
-        assert pandasai._is_conversational_answer is True
+        assert pandasai._is_conversational_answer is False
         assert pandasai._verbose is False
 
     def test_init_without_llm(self):
@@ -44,7 +45,7 @@ class TestPandasAI:
     def test_run(self, pandasai, llm):
         df = pd.DataFrame()
         llm._output = "1"
-        assert pandasai.run(df, "What number comes before 2?") == "1"
+        assert pandasai.run(df, "What number comes before 2?") == 1
 
     def test_run_with_conversational_answer(self, pandasai, llm):
         df = pd.DataFrame()
@@ -247,9 +248,17 @@ import set
 print(set([1, 2, 3]))
 """
         pandasai._llm._output = builtins_code
-        assert pandasai._clean_code(builtins_code) == "print(set([1, 2, 3]))"
         assert pandasai.run_code(builtins_code, pd.DataFrame()) == {1, 2, 3}
         assert pandasai.last_run_code == "print(set([1, 2, 3]))"
+
+    def test_clean_code_remove_environment_defaults(self, pandasai):
+        pandas_code = """
+import pandas as pd
+print(df.size)
+"""
+        pandasai._llm._output = pandas_code
+        pandasai.run_code(pandas_code, pd.DataFrame())
+        assert pandasai.last_run_code == "print(df.size)"
 
     def test_clean_code_keep_whitelist(self, pandasai):
         safe_code = """
@@ -258,7 +267,6 @@ print(np.array([1, 2, 3]))
 """
         safe_code = safe_code.strip()
         pandasai._llm._output = safe_code
-        assert pandasai._clean_code(safe_code) == safe_code
         assert pandasai.run_code(safe_code, pd.DataFrame()) == ""
         assert pandasai.last_run_code == safe_code
 
@@ -269,10 +277,10 @@ print(os.listdir())
 """
         pandasai._llm._output = malicious_code
         with pytest.raises(BadImportError):
-            pandasai._clean_code(malicious_code)
+            pandasai.run_code(malicious_code, pd.DataFrame())
 
     def test_clean_code_raise_import_error(self, pandasai):
-        """Test that clean code raises an ImportError when
+        """Test that an ImportError is raised when
         the code contains an import statement for an optional library."""
         optional_code = """
 import seaborn as sns
@@ -283,7 +291,7 @@ print(sns.__version__)
         # patch the import of seaborn to raise an ImportError
         with pytest.raises(ImportError):
             with patch.dict("sys.modules", {"seaborn": None}):
-                pandasai._clean_code(optional_code)
+                pandasai.run_code(optional_code, pd.DataFrame())
 
     def test_remove_df_overwrites(self, pandasai):
         malicious_code = """
@@ -291,7 +299,8 @@ df = pd.DataFrame([1,2,3])
 print(df)
 """
         pandasai._llm._output = malicious_code
-        assert pandasai._clean_code(malicious_code) == "print(df)"
+        pandasai.run_code(malicious_code, pd.DataFrame())
+        assert pandasai.last_run_code == "print(df)"
 
     def test_exception_handling(self, pandasai):
         pandasai.run_code = Mock(
@@ -305,3 +314,36 @@ print(df)
             "\nNo code found in the answer.\n"
         )
         assert pandasai.last_error == "No code found in the answer."
+
+    def test_cache(self, pandasai):
+        pandasai.clear_cache()
+        pandasai._enable_cache = True
+        pandasai._llm.call = Mock(return_value='print("Hello world")')
+        assert pandasai._cache.get("How many countries are in the dataframe?") is None
+        pandasai(
+            pd.DataFrame(),
+            "How many countries are in the dataframe?",
+        )
+        assert (
+            pandasai._cache.get("How many countries are in the dataframe?")
+            == 'print("Hello world")'
+        )
+        pandasai(
+            pd.DataFrame(),
+            "How many countries are in the dataframe?",
+        )
+        assert pandasai._llm.call.call_count == 1
+        pandasai._cache.delete("How many countries are in the dataframe?")
+
+    def test_process_id(self, pandasai):
+        process_id = pandasai.process_id()
+        assert isinstance(UUID(process_id, version=4), UUID)
+
+    def test_last_prompt_id(self, pandasai):
+        pandasai(pd.DataFrame(), "How many countries are in the dataframe?")
+        prompt_id = pandasai.last_prompt_id()
+        assert isinstance(UUID(prompt_id, version=4), UUID)
+
+    def test_last_prompt_id_no_prompt(self, pandasai):
+        with pytest.raises(ValueError):
+            pandasai.last_prompt_id()

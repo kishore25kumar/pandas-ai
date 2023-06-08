@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-""" PandasAI is a wrapper around a LLM to make dataframes conversational
+"""
+PandasAI is a wrapper around a LLM to make dataframes conversational
 
 This module includes the implementation of basis  PandasAI class with methods to run the LLMs
 models on Pandas dataframes. Following LLMs are implemented so far.
@@ -26,7 +27,7 @@ Example:
     from pandasai.llm.openai import OpenAI
     llm = OpenAI(api_token="YOUR_API_TOKEN")
 
-    pandas_ai = PandasAI(llm, conversational=False)
+    pandas_ai = PandasAI(llm)
     pandas_ai(df, prompt='Which are the 5 happiest countries?')
 
     ```
@@ -34,14 +35,17 @@ Example:
 import ast
 import io
 import re
+import sys
+import uuid
 from contextlib import redirect_stdout
-from typing import Optional
+from typing import Optional, Union
 
 import astor
 import matplotlib.pyplot as plt
 import pandas as pd
 
 from .constants import (
+    ENVIRONMENT_DEFAULTS,
     WHITELISTED_BUILTINS,
     WHITELISTED_LIBRARIES,
     WHITELISTED_OPTIONAL_LIBRARIES,
@@ -49,6 +53,7 @@ from .constants import (
 from .exceptions import BadImportError, LLMNotFoundError
 from .helpers._optional import import_optional_dependency
 from .helpers.anonymizer import anonymize_dataframe_head
+from .helpers.cache import Cache
 from .helpers.notebook import Notebook
 from .helpers.save_chart import add_save_chart
 from .llm.base import LLM
@@ -61,11 +66,12 @@ from .prompts.multiple_dataframes import MultipleDataframesPrompt
 
 # pylint: disable=too-many-instance-attributes disable=too-many-arguments
 class PandasAI:
-    """PandasAI is a wrapper around a LLM to make dataframes conversational.
+    """
+    PandasAI is a wrapper around a LLM to make dataframes conversational.
 
 
-    This is a an entry point of `pandasai` object. This class consists of methods to interface the
-    LLMs with Pandas     dataframes. A pandas dataframe metadata i.e df.head() and prompt is
+    This is an entry point of `pandasai` object. This class consists of methods to interface the
+    LLMs with Pandas     dataframes. A pandas dataframe metadata i.e. df.head() and prompt is
     passed on to chosen LLMs API end point to     generate a Python code to answer the questions
     asked. The resultant python code is run on actual data and answer is converted into a
     conversational form.
@@ -74,7 +80,7 @@ class PandasAI:
         Do not include the `self` parameter in the ``Args`` section.
     Args:
         _llm (obj): LLMs option to be used for API access
-        _verbose (bool, optional): To show the intermediate outputs e.g python code
+        _verbose (bool, optional): To show the intermediate outputs e.g. python code
         generated and execution step on the prompt. Default to False
         _is_conversational_answer (bool, optional): Whether to return answer in conversational
         form. Default to False
@@ -87,16 +93,16 @@ class PandasAI:
         last_run_code (str, optional): Pass the last execution / run. Default to None
         code_output (str, optional): The code output if any. Default to None
         last_error (str, optional): Error of running code last time. Default to None
+        prompt_id (str, optional): Unique ID to differentiate calls. Default to None
 
 
-    Returns:
-        response (str): Returns the Response to a Question related to Data
+    Returns (str): Response to a Question related to Data
 
     """
 
     _llm: LLM
     _verbose: bool = False
-    _is_conversational_answer: bool = True
+    _is_conversational_answer: bool = False
     _enforce_privacy: bool = False
     _max_retries: int = 3
     _is_notebook: bool = False
@@ -107,6 +113,9 @@ class PandasAI:
         "num_columns": None,
         "rows_to_display": None,
     }
+    _cache: Cache = Cache()
+    _enable_cache: bool = True
+    _prompt_id: Optional[str] = None
     last_code_generated: Optional[str] = None
     last_run_code: Optional[str] = None
     code_output: Optional[str] = None
@@ -115,10 +124,11 @@ class PandasAI:
     def __init__(
         self,
         llm=None,
-        conversational=True,
+        conversational=False,
         verbose=False,
         enforce_privacy=False,
         save_charts=False,
+        enable_cache=True,
     ):
         """
 
@@ -126,10 +136,11 @@ class PandasAI:
 
         Args:
             llm (object): LLMs option to be used for API access. Default is None
-            conversational (bool): Whether to return answer in conversational form. Default to True
-            verbose (bool): To show the intermediate outputs e.g python code generated and
+            conversational (bool): Whether to return answer in conversational form. Default to False
+            verbose (bool): To show the intermediate outputs e.g. python code generated and
              execution step on the prompt.  Default to False
             enforce_privacy (bool): Execute the codes with Privacy Mode ON.  Default to False
+            save_charts (bool): Save the charts generated in the notebook. Default to False
         """
         if llm is None:
             raise LLMNotFoundError(
@@ -140,12 +151,15 @@ class PandasAI:
         self._verbose = verbose
         self._enforce_privacy = enforce_privacy
         self._save_charts = save_charts
+        self._enable_cache = enable_cache
+        self._process_id = str(uuid.uuid4())
 
         self.notebook = Notebook()
         self._in_notebook = self.notebook.in_notebook()
 
     def conversational_answer(self, question: str, answer: str) -> str:
-        """Returns the answer in conversational form about the resultant data.
+        """
+        Returns the answer in conversational form about the resultant data.
 
         Args:
             question (str): A question in Conversational form
@@ -171,7 +185,7 @@ class PandasAI:
         show_code: bool = False,
         anonymize_df: bool = True,
         use_error_correction_framework: bool = True,
-    ) -> str:
+    ) -> Union[str, pd.DataFrame]:
         """
         Run the PandasAI to make Dataframes Conversational.
 
@@ -186,69 +200,79 @@ class PandasAI:
             use_error_correction_framework (bool): Turn on Error Correction mechanism.
             Default to True
 
-        Returns: Answer to the Input Questions about the DataFrame
+        Returns (str): Answer to the Input Questions about the DataFrame
 
         """
 
         self.log(f"Running PandasAI with {self._llm.type} LLM...")
 
+        self._prompt_id = str(uuid.uuid4())
+        self.log(f"Prompt ID: {self._prompt_id}")
+
         try:
-            rows_to_display = 0 if self._enforce_privacy else 5
-
-            multiple: bool = isinstance(data_frame, list)
-
-            if multiple:
-                heads = [
-                    anonymize_dataframe_head(dataframe)
-                    if anonymize_df
-                    else dataframe.head(rows_to_display)
-                    for dataframe in data_frame
-                ]
-
-                code = self._llm.generate_code(
-                    MultipleDataframesPrompt(dataframes=heads),
-                    prompt,
-                )
-
-                self._original_instructions = {
-                    "question": prompt,
-                    "df_head": heads,
-                    "rows_to_display": rows_to_display,
-                }
-
+            if self._enable_cache and self._cache.get(prompt):
+                self.log("Using cached response")
+                code = self._cache.get(prompt)
             else:
-                df_head = data_frame.head(rows_to_display)
-                if anonymize_df:
-                    df_head = anonymize_dataframe_head(df_head)
+                rows_to_display = 0 if self._enforce_privacy else 5
 
-                code = self._llm.generate_code(
-                    GeneratePythonCodePrompt(
-                        prompt=prompt,
-                        df_head=df_head,
-                        num_rows=data_frame.shape[0],
-                        num_columns=data_frame.shape[1],
-                        rows_to_display=rows_to_display,
-                    ),
-                    prompt,
+                multiple: bool = isinstance(data_frame, list)
+
+                if multiple:
+                    heads = [
+                        anonymize_dataframe_head(dataframe)
+                        if anonymize_df
+                        else dataframe.head(rows_to_display)
+                        for dataframe in data_frame
+                    ]
+
+                    code = self._llm.generate_code(
+                        MultipleDataframesPrompt(dataframes=heads),
+                        prompt,
+                    )
+
+                    self._original_instructions = {
+                        "question": prompt,
+                        "df_head": heads,
+                        "rows_to_display": rows_to_display,
+                    }
+
+                else:
+                    df_head = data_frame.head(rows_to_display)
+                    if anonymize_df:
+                        df_head = anonymize_dataframe_head(df_head)
+
+                    code = self._llm.generate_code(
+                        GeneratePythonCodePrompt(
+                            prompt=prompt,
+                            df_head=df_head,
+                            num_rows=data_frame.shape[0],
+                            num_columns=data_frame.shape[1],
+                            rows_to_display=rows_to_display,
+                        ),
+                        prompt,
+                    )
+
+                    self._original_instructions = {
+                        "question": prompt,
+                        "df_head": df_head,
+                        "num_rows": data_frame.shape[0],
+                        "num_columns": data_frame.shape[1],
+                        "rows_to_display": rows_to_display,
+                    }
+
+                self.last_code_generated = code
+                self.log(
+                    f"""
+                        Code generated:
+                        ```
+                        {code}
+                        ```
+                    """
                 )
 
-                self._original_instructions = {
-                    "question": prompt,
-                    "df_head": df_head,
-                    "num_rows": data_frame.shape[0],
-                    "num_columns": data_frame.shape[1],
-                    "rows_to_display": rows_to_display,
-                }
+                self._cache.set(prompt, code)
 
-            self.last_code_generated = code
-            self.log(
-                f"""
-                    Code generated:
-                    ```
-                    {code}
-                    ```
-                """
-            )
             if show_code and self._in_notebook:
                 self.notebook.create_new_cell(code)
 
@@ -274,6 +298,12 @@ class PandasAI:
                 f"\n{exception}\n"
             )
 
+    def clear_cache(self):
+        """
+        Clears the cache of the PandasAI instance.
+        """
+        self._cache.clear()
+
     def __call__(
         self,
         data_frame: pd.DataFrame,
@@ -282,9 +312,10 @@ class PandasAI:
         show_code: bool = False,
         anonymize_df: bool = True,
         use_error_correction_framework: bool = True,
-    ) -> str:
+    ) -> Union[str, pd.DataFrame]:
         """
-        __call__ method of PandasAI class. It call `run` method
+        __call__ method of PandasAI class. It calls the `run` method.
+
         Args:
             data_frame:
             prompt:
@@ -293,7 +324,7 @@ class PandasAI:
             anonymize_df:
             use_error_correction_framework:
 
-        Returns:
+        Returns (str): Answer to the Input Questions about the DataFrame.
 
         """
 
@@ -307,7 +338,8 @@ class PandasAI:
         )
 
     def _is_unsafe_import(self, node: ast.stmt) -> bool:
-        """Remove non-whitelisted imports from the code to prevent malicious code execution
+        """
+        Remove non-whitelisted imports from the code to prevent malicious code execution
 
         Args:
             node (object): ast.stmt
@@ -318,23 +350,27 @@ class PandasAI:
 
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             for alias in node.names:
-                if alias.name in WHITELISTED_BUILTINS:
+                if (
+                    alias.name in WHITELISTED_BUILTINS
+                    or alias.name in ENVIRONMENT_DEFAULTS
+                ):
                     return True
                 if alias.name in WHITELISTED_OPTIONAL_LIBRARIES:
                     import_optional_dependency(alias.name)
                     continue
-                if alias.name not in WHITELISTED_LIBRARIES:
+                if alias.name.split(".")[0] not in WHITELISTED_LIBRARIES:
                     raise BadImportError(alias.name)
 
         return False
 
-    def _is_df_overwrite(self, node: ast.stmt) -> str:
+    def _is_df_overwrite(self, node: ast.stmt) -> bool:
         """
         Remove df declarations from the code to prevent malicious code execution. A helper method.
+
         Args:
             node (object): ast.stmt
 
-        Returns (str):
+        Returns (bool):
 
         """
 
@@ -347,6 +383,7 @@ class PandasAI:
     def _clean_code(self, code: str) -> str:
         """
         A method to clean the code to prevent malicious code execution
+
         Args:
             code(str): A python code
 
@@ -374,13 +411,14 @@ class PandasAI:
         """
         A method to execute the python code generated by LLMs to answer the question about the
         input dataframe. Run the code in the current context and return the result.
+
         Args:
             code (str): A python code to execute
             data_frame (pd.DataFrame): A full Pandas DataFrame
             use_error_correction_framework (bool): Turn on Error Correction mechanism.
             Default to True
 
-        Returns:
+        Returns (str): String representation of the result of the code execution.
 
         """
 
@@ -390,7 +428,7 @@ class PandasAI:
 
         # Add save chart code
         if self._save_charts:
-            code = add_save_chart(code)
+            code = add_save_chart(code, self._prompt_id)
 
         # Get the code to run removing unsafe imports and df overwrites
         code_to_run = self._clean_code(code)
@@ -404,8 +442,10 @@ Code running:
         )
 
         environment: dict = {
-            "pd": pd,
-            "plt": plt,
+            **{
+                alias: sys.modules[library]
+                for library, alias in ENVIRONMENT_DEFAULTS.items()
+            },
             "__builtins__": {
                 **{builtin: __builtins__[builtin] for builtin in WHITELISTED_BUILTINS},
             },
@@ -480,3 +520,13 @@ Code running:
         """Log a message"""
         if self._verbose:
             print(message)
+
+    def process_id(self) -> str:
+        """Return the id of this PandasAI object."""
+        return self._process_id
+
+    def last_prompt_id(self) -> str:
+        """Return the id of the last prompt that was run."""
+        if self._prompt_id is None:
+            raise ValueError("Pandas AI has not been run yet.")
+        return self._prompt_id
